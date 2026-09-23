@@ -6,6 +6,8 @@ import os
 import sys
 import tempfile
 import unittest
+import zipfile
+from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -26,7 +28,6 @@ class TestDocumentAnalyzer(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.base_path = Path(self.temp_dir.name)
 
-        # Create a valid test docx file
         self.valid_docx_path = self.base_path / "valid_test.docx"
         doc = Document()
         doc.add_heading("Fitness Blueprint", level=1)
@@ -37,6 +38,12 @@ class TestDocumentAnalyzer(unittest.TestCase):
     def tearDown(self):
         """Clean up temporary directory."""
         self.temp_dir.cleanup()
+
+    def _capture_ingest(self, analyzer):
+        captured_output = StringIO()
+        with redirect_stdout(captured_output):
+            ingested = analyzer.ingest_docs()
+        return ingested, captured_output.getvalue()
 
     def test_ingest_and_digest_valid_docs(self):
         """Test ingesting and digesting valid docx files."""
@@ -57,17 +64,30 @@ class TestDocumentAnalyzer(unittest.TestCase):
     def test_oversized_file_rejection(self):
         """Test that files exceeding max_file_size_bytes are rejected."""
         analyzer = DocumentAnalyzer(base_dir=str(self.base_path), max_file_size_bytes=10)
+        ingested, output = self._capture_ingest(analyzer)
 
-        captured_output = StringIO()
-        sys.stdout = captured_output
-        try:
-            ingested = analyzer.ingest_docs()
-        finally:
-            sys.stdout = sys.__stdout__
-
-        output = captured_output.getvalue()
         self.assertNotIn("valid_test.docx", ingested)
         self.assertIn("File size exceeds limit", output)
+
+    def test_expanded_archive_size_is_bounded_before_parser(self):
+        """Highly compressed DOCX content is rejected by expanded-size limit."""
+        bomb_path = self.base_path / "compressed-bomb.docx"
+        bomb_doc = Document()
+        bomb_doc.add_paragraph("small visible document")
+        bomb_doc.save(bomb_path)
+        with zipfile.ZipFile(bomb_path, "a", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("customXml/highly-compressible.xml", "A" * 200_000)
+
+        self.assertLess(bomb_path.stat().st_size, 100_000)
+        analyzer = DocumentAnalyzer(
+            base_dir=str(self.base_path),
+            max_file_size_bytes=100_000,
+            max_expanded_file_size_bytes=100_000,
+        )
+        ingested, output = self._capture_ingest(analyzer)
+
+        self.assertNotIn("compressed-bomb.docx", ingested)
+        self.assertIn("Expanded document size exceeds limit", output)
 
     def test_symlink_outside_base_dir_is_rejected(self):
         """A .docx symlink must not escape the configured source root."""
@@ -84,17 +104,40 @@ class TestDocumentAnalyzer(unittest.TestCase):
                 self.skipTest(f"symlinks unavailable in this environment: {exc}")
 
             analyzer = DocumentAnalyzer(base_dir=str(self.base_path))
-            captured_output = StringIO()
-            sys.stdout = captured_output
-            try:
-                ingested = analyzer.ingest_docs()
-            finally:
-                sys.stdout = sys.__stdout__
+            ingested, output = self._capture_ingest(analyzer)
 
-            output = captured_output.getvalue()
             self.assertNotIn("linked-outside.docx", ingested)
             self.assertIn("linked-outside.docx", output)
             self.assertIn("Access denied (path outside base directory)", output)
+
+    def test_symlink_loop_is_rejected_without_aborting_scan(self):
+        """An unresolvable .docx symlink is rejected while valid files continue."""
+        loop_path = self.base_path / "loop.docx"
+        try:
+            os.symlink(loop_path, loop_path)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlinks unavailable in this environment: {exc}")
+
+        analyzer = DocumentAnalyzer(base_dir=str(self.base_path))
+        ingested, output = self._capture_ingest(analyzer)
+
+        self.assertIn("valid_test.docx", ingested)
+        self.assertNotIn("loop.docx", ingested)
+        self.assertIn("Unable to resolve file path", output)
+
+    def test_hidden_parent_of_base_does_not_filter_documents(self):
+        """Filtering applies only to descendants of base_dir, not its ancestors."""
+        hidden_workspace = self.base_path / ".workspace"
+        project_root = hidden_workspace / "project"
+        project_root.mkdir(parents=True)
+        visible_docx = project_root / "visible.docx"
+        doc = Document()
+        doc.add_paragraph("visible")
+        doc.save(visible_docx)
+
+        analyzer = DocumentAnalyzer(base_dir=str(project_root))
+        ingested, _ = self._capture_ingest(analyzer)
+        self.assertIn("visible.docx", ingested)
 
     def test_non_regular_docx_path_is_rejected(self):
         """A directory with a .docx suffix must not be parsed as a document."""
@@ -102,16 +145,29 @@ class TestDocumentAnalyzer(unittest.TestCase):
         fake_docx_dir.mkdir()
 
         analyzer = DocumentAnalyzer(base_dir=str(self.base_path))
-        captured_output = StringIO()
-        sys.stdout = captured_output
-        try:
-            ingested = analyzer.ingest_docs()
-        finally:
-            sys.stdout = sys.__stdout__
+        ingested, output = self._capture_ingest(analyzer)
 
-        output = captured_output.getvalue()
         self.assertNotIn("directory.docx", ingested)
         self.assertIn("Path is not a regular file", output)
+
+    def test_parser_receives_stable_open_file_handle(self):
+        """Parser consumes the already-open validated handle rather than reopening a path."""
+        from docx import Document as RealDocument
+
+        parser_sources = []
+
+        def parse_from_handle(source):
+            parser_sources.append(source)
+            return RealDocument(source)
+
+        analyzer = DocumentAnalyzer(base_dir=str(self.base_path))
+        with patch("analyze_docs.Document", side_effect=parse_from_handle):
+            ingested, _ = self._capture_ingest(analyzer)
+
+        self.assertIn("valid_test.docx", ingested)
+        self.assertTrue(parser_sources)
+        self.assertTrue(hasattr(parser_sources[0], "read"))
+        self.assertNotIsInstance(parser_sources[0], (str, Path))
 
     def test_corrupted_file_handling(self):
         """Corrupted docx files fail safely without a traceback."""
@@ -120,15 +176,8 @@ class TestDocumentAnalyzer(unittest.TestCase):
             corrupt_file.write(b"NOT_A_REAL_DOCX_FILE_DATA_1234567890")
 
         analyzer = DocumentAnalyzer(base_dir=str(self.base_path))
+        ingested, output = self._capture_ingest(analyzer)
 
-        captured_output = StringIO()
-        sys.stdout = captured_output
-        try:
-            ingested = analyzer.ingest_docs()
-        finally:
-            sys.stdout = sys.__stdout__
-
-        output = captured_output.getvalue()
         self.assertNotIn("corrupt.docx", ingested)
         self.assertIn("Failed to ingest corrupt.docx", output)
         self.assertNotIn("Traceback", output)
@@ -138,21 +187,27 @@ class TestDocumentAnalyzer(unittest.TestCase):
         sensitive_detail = "/private/customer/path/token-like-detail"
         analyzer = DocumentAnalyzer(base_dir=str(self.base_path))
 
-        captured_output = StringIO()
-        sys.stdout = captured_output
-        try:
-            with patch(
-                "analyze_docs.Document",
-                side_effect=RuntimeError(sensitive_detail),
-            ):
-                ingested = analyzer.ingest_docs()
-        finally:
-            sys.stdout = sys.__stdout__
+        with patch(
+            "analyze_docs.Document",
+            side_effect=RuntimeError(sensitive_detail),
+        ):
+            ingested, output = self._capture_ingest(analyzer)
 
-        output = captured_output.getvalue()
         self.assertNotIn("valid_test.docx", ingested)
         self.assertIn("Ingestion error (RuntimeError)", output)
         self.assertNotIn(sensitive_detail, output)
+
+    def test_stdout_capture_is_restored(self):
+        """Ingestion tests preserve an enclosing runner's stdout stream."""
+        outer_stream = StringIO()
+        original_stdout = sys.stdout
+        try:
+            sys.stdout = outer_stream
+            analyzer = DocumentAnalyzer(base_dir=str(self.base_path))
+            self._capture_ingest(analyzer)
+            self.assertIs(sys.stdout, outer_stream)
+        finally:
+            sys.stdout = original_stdout
 
     def test_key_topics_extraction(self):
         """Test topic extraction algorithm."""
