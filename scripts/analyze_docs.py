@@ -4,21 +4,36 @@ Document Analysis System
 Ingests, digests, and suggests paths based on Word documents in the repository.
 """
 
+import os
+import stat
 import sys
+import zipfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, BinaryIO, Dict, List
 
 from docx import Document
 from docx.opc.exceptions import OpcError, PackageNotFoundError
 
-# Default maximum file size limit for ingested document files (10 MB)
+# Resource limits for ingested document files.
 DEFAULT_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_EXPANDED_FILE_SIZE_BYTES = 50 * 1024 * 1024
+DEFAULT_MAX_ARCHIVE_MEMBERS = 2048
+
+
+class DocumentArchiveLimitError(ValueError):
+    """Raised when a DOCX archive exceeds bounded parser resource limits."""
 
 
 class DocumentAnalyzer:
     """Handles document ingestion, digestion, and path suggestion."""
 
-    def __init__(self, base_dir: str = ".", max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES):
+    def __init__(
+        self,
+        base_dir: str = ".",
+        max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES,
+        max_expanded_file_size_bytes: int = DEFAULT_MAX_EXPANDED_FILE_SIZE_BYTES,
+        max_archive_members: int = DEFAULT_MAX_ARCHIVE_MEMBERS,
+    ):
         self.base_dir = Path(base_dir).resolve()
         if not self.base_dir.exists() or not self.base_dir.is_dir():
             print(
@@ -26,7 +41,22 @@ class DocumentAnalyzer:
             )
             sys.exit(1)
         self.max_file_size_bytes = max_file_size_bytes
+        self.max_expanded_file_size_bytes = max_expanded_file_size_bytes
+        self.max_archive_members = max_archive_members
         self.documents: Dict[str, Any] = {}
+
+    def _validate_docx_archive(self, document_file: BinaryIO) -> None:
+        """Reject archives that exceed bounded expansion or member-count limits."""
+        document_file.seek(0)
+        with zipfile.ZipFile(document_file) as archive:
+            archive_members = archive.infolist()
+            if len(archive_members) > self.max_archive_members:
+                raise DocumentArchiveLimitError("archive member count exceeds limit")
+
+            expanded_size = sum(member.file_size for member in archive_members)
+            if expanded_size > self.max_expanded_file_size_bytes:
+                raise DocumentArchiveLimitError("expanded document size exceeds limit")
+        document_file.seek(0)
 
     def ingest_docs(self) -> List[str]:
         """
@@ -42,14 +72,20 @@ class DocumentAnalyzer:
             for file_path in self.base_dir.glob("**/*.docx")
             if not any(
                 path_part.startswith(".") or path_part.startswith("~$")
-                for path_part in file_path.parts
+                for path_part in file_path.relative_to(self.base_dir).parts
             )
         ]
         ingested_document_names = []
 
         for document_path in found_docx_paths:
-            # Prevent directory traversal attacks by ensuring path containment
-            resolved_document_path = document_path.resolve()
+            try:
+                resolved_document_path = document_path.resolve()
+            except (OSError, RuntimeError):
+                print(
+                    f"✗ Failed to ingest {document_path.name}: Unable to resolve file path"
+                )
+                continue
+
             if not (
                 resolved_document_path == self.base_dir
                 or self.base_dir in resolved_document_path.parents
@@ -59,29 +95,30 @@ class DocumentAnalyzer:
                 )
                 continue
 
-            if not resolved_document_path.is_file():
-                print(
-                    f"✗ Failed to ingest {document_path.name}: Path is not a regular file"
-                )
-                continue
-
-            # Check file size limit to prevent resource exhaustion / DoS
+            file_descriptor = None
             try:
-                document_file_size = resolved_document_path.stat().st_size
-            except (PermissionError, OSError):
-                print(
-                    f"✗ Failed to ingest {document_path.name}: Unable to query file stats"
-                )
-                continue
+                open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                open_flags |= getattr(os, "O_NOFOLLOW", 0)
+                file_descriptor = os.open(resolved_document_path, open_flags)
+                document_stat = os.fstat(file_descriptor)
 
-            if document_file_size > self.max_file_size_bytes:
-                print(
-                    f"✗ Failed to ingest {document_path.name}: File size exceeds limit ({document_file_size} bytes)"
-                )
-                continue
+                if not stat.S_ISREG(document_stat.st_mode):
+                    print(
+                        f"✗ Failed to ingest {document_path.name}: Path is not a regular file"
+                    )
+                    continue
 
-            try:
-                parsed_docx = Document(resolved_document_path)
+                if document_stat.st_size > self.max_file_size_bytes:
+                    print(
+                        f"✗ Failed to ingest {document_path.name}: File size exceeds limit ({document_stat.st_size} bytes)"
+                    )
+                    continue
+
+                with os.fdopen(file_descriptor, "rb") as document_file:
+                    file_descriptor = None
+                    self._validate_docx_archive(document_file)
+                    parsed_docx = Document(document_file)
+
                 paragraph_list = [
                     paragraph_element.text
                     for paragraph_element in parsed_docx.paragraphs
@@ -94,7 +131,13 @@ class DocumentAnalyzer:
                 }
                 ingested_document_names.append(document_path.name)
                 print(f"✓ Ingested: {document_path.name}")
-            except PackageNotFoundError:
+            except DocumentArchiveLimitError as archive_limit_error:
+                if "member count" in str(archive_limit_error):
+                    reason = "Archive member count exceeds limit"
+                else:
+                    reason = "Expanded document size exceeds limit"
+                print(f"✗ Failed to ingest {document_path.name}: {reason}")
+            except (zipfile.BadZipFile, zipfile.LargeZipFile, PackageNotFoundError):
                 print(
                     f"✗ Failed to ingest {document_path.name}: Invalid or missing Word document package"
                 )
@@ -115,6 +158,9 @@ class DocumentAnalyzer:
                 print(
                     f"✗ Failed to ingest {document_path.name}: Ingestion error ({error_class_name})"
                 )
+            finally:
+                if file_descriptor is not None:
+                    os.close(file_descriptor)
 
         print(f"\nTotal documents ingested: {len(ingested_document_names)}")
         return ingested_document_names
