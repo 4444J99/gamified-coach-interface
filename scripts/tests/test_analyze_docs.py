@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 from docx import Document
 
@@ -55,7 +56,6 @@ class TestDocumentAnalyzer(unittest.TestCase):
 
     def test_oversized_file_rejection(self):
         """Test that files exceeding max_file_size_bytes are rejected."""
-        # Set max_file_size_bytes to a small value (10 bytes)
         analyzer = DocumentAnalyzer(base_dir=str(self.base_path), max_file_size_bytes=10)
 
         captured_output = StringIO()
@@ -69,13 +69,39 @@ class TestDocumentAnalyzer(unittest.TestCase):
         self.assertNotIn("valid_test.docx", ingested)
         self.assertIn("File size exceeds limit", output)
 
-    def test_path_traversal_prevention(self):
-        """Test that files located outside base_dir are rejected."""
-        sub_dir = self.base_path / "sub"
-        sub_dir.mkdir()
-        analyzer = DocumentAnalyzer(base_dir=str(sub_dir))
+    def test_symlink_outside_base_dir_is_rejected(self):
+        """A .docx symlink must not escape the configured source root."""
+        with tempfile.TemporaryDirectory() as outside_temp_dir:
+            outside_path = Path(outside_temp_dir) / "outside.docx"
+            outside_doc = Document()
+            outside_doc.add_paragraph("outside source root")
+            outside_doc.save(outside_path)
 
-        # Pass a document path outside base_dir manually to test logic
+            linked_path = self.base_path / "linked-outside.docx"
+            try:
+                os.symlink(outside_path, linked_path)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlinks unavailable in this environment: {exc}")
+
+            analyzer = DocumentAnalyzer(base_dir=str(self.base_path))
+            captured_output = StringIO()
+            sys.stdout = captured_output
+            try:
+                ingested = analyzer.ingest_docs()
+            finally:
+                sys.stdout = sys.__stdout__
+
+            output = captured_output.getvalue()
+            self.assertNotIn("linked-outside.docx", ingested)
+            self.assertIn("linked-outside.docx", output)
+            self.assertIn("Access denied (path outside base directory)", output)
+
+    def test_non_regular_docx_path_is_rejected(self):
+        """A directory with a .docx suffix must not be parsed as a document."""
+        fake_docx_dir = self.base_path / "directory.docx"
+        fake_docx_dir.mkdir()
+
+        analyzer = DocumentAnalyzer(base_dir=str(self.base_path))
         captured_output = StringIO()
         sys.stdout = captured_output
         try:
@@ -84,13 +110,14 @@ class TestDocumentAnalyzer(unittest.TestCase):
             sys.stdout = sys.__stdout__
 
         output = captured_output.getvalue()
-        self.assertEqual(len(ingested), 0)
+        self.assertNotIn("directory.docx", ingested)
+        self.assertIn("Path is not a regular file", output)
 
     def test_corrupted_file_handling(self):
-        """Test that corrupted docx files are handled gracefully without crashing or leaking sensitive info."""
+        """Corrupted docx files fail safely without a traceback."""
         corrupt_path = self.base_path / "corrupt.docx"
-        with open(corrupt_path, "wb") as f:
-            f.write(b"NOT_A_REAL_DOCX_FILE_DATA_1234567890")
+        with open(corrupt_path, "wb") as corrupt_file:
+            corrupt_file.write(b"NOT_A_REAL_DOCX_FILE_DATA_1234567890")
 
         analyzer = DocumentAnalyzer(base_dir=str(self.base_path))
 
@@ -104,8 +131,28 @@ class TestDocumentAnalyzer(unittest.TestCase):
         output = captured_output.getvalue()
         self.assertNotIn("corrupt.docx", ingested)
         self.assertIn("Failed to ingest corrupt.docx", output)
-        # Ensure raw stack trace is not dumped to user output
         self.assertNotIn("Traceback", output)
+
+    def test_unexpected_parser_error_does_not_leak_exception_message(self):
+        """Unexpected parser failures expose the class, not raw sensitive details."""
+        sensitive_detail = "/private/customer/path/token-like-detail"
+        analyzer = DocumentAnalyzer(base_dir=str(self.base_path))
+
+        captured_output = StringIO()
+        sys.stdout = captured_output
+        try:
+            with patch(
+                "analyze_docs.Document",
+                side_effect=RuntimeError(sensitive_detail),
+            ):
+                ingested = analyzer.ingest_docs()
+        finally:
+            sys.stdout = sys.__stdout__
+
+        output = captured_output.getvalue()
+        self.assertNotIn("valid_test.docx", ingested)
+        self.assertIn("Ingestion error (RuntimeError)", output)
+        self.assertNotIn(sensitive_detail, output)
 
     def test_key_topics_extraction(self):
         """Test topic extraction algorithm."""
